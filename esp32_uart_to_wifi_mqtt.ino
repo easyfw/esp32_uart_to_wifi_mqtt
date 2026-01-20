@@ -27,19 +27,20 @@
   #define DBG_PRINTF(...)
 #endif
 
-#define PROTO_STX 0x02
-#define PROTO_ETX 0x03
-#define LED_PIN   2
+#define PROTO_STX   0x02
+#define PROTO_ETX   0x03
+#define LED_PIN     2
+#define RX_BUF_SIZE 1024
 
 //==============================================================================
 // WiFi 설정
 //==============================================================================
 
-//const char* WIFI_SSID = "형경산업";
-//const char* WIFI_PASSWORD = "12341234";
+const char* WIFI_SSID = "형경산업";
+const char* WIFI_PASSWORD = "12341234";
 
-const char* WIFI_SSID = "iptime";
-const char* WIFI_PASSWORD = "";
+//const char* WIFI_SSID = "iptime";
+//const char* WIFI_PASSWORD = "";
 
 //==============================================================================
 // MQTT 설정
@@ -85,7 +86,7 @@ enum RxState {
 };
 
 RxState rxState = RX_WAIT_STX;
-uint8_t rxBuffer[512];
+uint8_t rxBuffer[RX_BUF_SIZE];
 int rxIndex = 0;
 uint16_t rxDataLen = 0;
 int rxDataCount = 0;
@@ -95,18 +96,19 @@ unsigned long rxStartTime = 0;
 // MQTT 전송 큐
 //==============================================================================
 
-#define MQTT_QUEUE_SIZE 10
+#define MQTT_QUEUE_SIZE 100
 
 struct MqttQueueItem {
     bool valid;
     uint8_t itemCount;
-    uint16_t itemIds[10];
-    uint8_t itemQualities[10];
-    int32_t itemValues[10];
+    uint16_t itemIds[MQTT_QUEUE_SIZE];
+    uint8_t itemQualities[MQTT_QUEUE_SIZE];
+    int32_t itemValues[MQTT_QUEUE_SIZE];
     unsigned long timestamp;
 };
 
 MqttQueueItem mqttQueue[MQTT_QUEUE_SIZE];
+
 int mqttQueueHead = 0;
 int mqttQueueTail = 0;
 
@@ -144,7 +146,7 @@ void setup() {
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
     mqttClient.setKeepAlive(60);
-    mqttClient.setBufferSize(512);
+    mqttClient.setBufferSize(RX_BUF_SIZE);
 }
 
 //==============================================================================
@@ -208,7 +210,7 @@ void processUART()
                 DBG_PRINTF("[RX] Data length: %d bytes\n", rxDataLen);
                 
                 // 길이 유효성 검사
-                if (rxDataLen > 500) 
+                if (rxDataLen > RX_BUF_SIZE - 12) 
                 {
                     DBG_PRINTLN("[RX] ERROR: Length too large! Resetting.");
                     rxState = RX_WAIT_STX;
@@ -271,7 +273,7 @@ void processUART()
         }
         
         // 버퍼 오버플로우 방지
-        if (rxIndex >= 510) 
+        if (rxIndex >= RX_BUF_SIZE - 2) 
         {
             DBG_PRINTLN("[RX] BUFFER OVERFLOW! Resetting.");
             rxState = RX_WAIT_STX;
@@ -523,6 +525,51 @@ int getMqttQueueSize()
     return size;
 }
 
+#if 1
+//
+void processMqttQueue()
+{
+    if (!mqttConnected) return;
+    if (!mqttQueue[mqttQueueTail].valid) return;
+    
+    MqttQueueItem* item = &mqttQueue[mqttQueueTail];
+    
+    StaticJsonDocument<512> doc;
+    doc["device"] = MQTT_CLIENT_ID;
+    doc["timestamp"] = item->timestamp;
+    doc["packet_id"] = packetCount;
+    
+    // ★ 배열 대신 개별 필드로 변경
+    for (int i = 0; i < item->itemCount; i++) 
+    {
+        String valueKey = "value_" + String(item->itemIds[i]);
+        String qualityKey = "quality_" + String(item->itemIds[i]);
+        
+        doc[valueKey] = item->itemValues[i];
+        doc[qualityKey] = item->itemQualities[i];
+    }
+    
+    char jsonBuffer[512];
+    serializeJson(doc, jsonBuffer);
+    
+    DBG_PRINTF("[MQTT] Publish: %s\n", jsonBuffer);
+    
+    if (mqttClient.publish(MQTT_TOPIC_DATA, jsonBuffer)) 
+    {
+        DBG_PRINTLN("[MQTT] OK!");
+        mqttSentCount++;
+    } 
+    else 
+    {
+        DBG_PRINTLN("[MQTT] FAILED!");
+        mqttFailCount++;
+    }
+    
+    item->valid = false;
+    mqttQueueTail = (mqttQueueTail + 1) % MQTT_QUEUE_SIZE;
+}
+
+#else
 //
 void processMqttQueue()
 {
@@ -564,11 +611,11 @@ void processMqttQueue()
     item->valid = false;
     mqttQueueTail = (mqttQueueTail + 1) % MQTT_QUEUE_SIZE;
 }
+#endif
 
 //==============================================================================
 // 상태 출력
 //==============================================================================
-
 void printStatus()
 {
     DBG_PRINTLN("\n======== STATUS ========");
@@ -582,6 +629,7 @@ void printStatus()
     DBG_PRINTLN("========================\n");
 }
 
+//
 void publishStatus()
 {
     if (!mqttConnected) return;
