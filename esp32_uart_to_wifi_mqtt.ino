@@ -36,11 +36,11 @@
 // WiFi 설정
 //==============================================================================
 
-const char* WIFI_SSID = "형경산업";
-const char* WIFI_PASSWORD = "12341234";
+//const char* WIFI_SSID = "형경산업";
+//const char* WIFI_PASSWORD = "12341234";
 
-//const char* WIFI_SSID = "iptime";
-//const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID = "C";
+const char* WIFI_PASSWORD = "12341234";
 
 //==============================================================================
 // MQTT 설정
