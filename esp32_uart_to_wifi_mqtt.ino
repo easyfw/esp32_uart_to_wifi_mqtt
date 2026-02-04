@@ -5,15 +5,26 @@
  * - 길이 기반 패킷 수신으로 변경
  * - 데이터 중간에 0x03이 있어도 정상 수신
  * 
+ * 사용법:
+ * 1. 처음 부팅 또는 저장된 WiFi 연결 실패 시 → "ESP32-GA1-Setup" AP 생성
+ * 2. 스마트폰/PC로 해당 AP에 연결
+ * 3. 브라우저에서 192.168.4.1 접속
+ * 4. WiFi 선택 및 비밀번호 입력 후 저장
+ * 5. ESP32 자동 재부팅 후 설정한 WiFi에 연결
+ * 
+ * ★ 설정 초기화: GPIO0 버튼을 5초간 누르면 WiFi 설정 삭제 후 재부팅
+ * 
  * 패킷 구조:
  * [STX(1)] [LEN_L(1)] [LEN_H(1)] [DATA(LEN)] [CHK(1)] [ETX(1)]
  * 
- * 작성일: 2026-01-19
+ * 작성일: 2026-01-21
  ******************************************************************************/
 
 #include <WiFi.h>
+#include <WiFiManager.h>  // ★ WiFiManager 라이브러리 추가
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>  // ★ NVS 저장용
 
 #define USE_DEBUG_SERIAL 1
 
@@ -30,31 +41,41 @@
 #define PROTO_STX   0x02
 #define PROTO_ETX   0x03
 #define LED_PIN     2
+#define RESET_PIN   0       // ★ GPIO0 (BOOT 버튼) - WiFi 설정 초기화용
 #define RX_BUF_SIZE 1024
 
 //==============================================================================
-// WiFi 설정
+// WiFiManager 설정
 //==============================================================================
 
-//const char* WIFI_SSID = "형경산업";
-//const char* WIFI_PASSWORD = "12341234";
+#define AP_NAME         "ESP32-Wifi-Setup"   // 설정 모드 AP 이름
+#define AP_PASSWORD     "12345678"          // 설정 모드 AP 비밀번호 (8자 이상)
+#define PORTAL_TIMEOUT  180                 // 설정 포털 타임아웃 (초)
 
-const char* WIFI_SSID = "C";
-const char* WIFI_PASSWORD = "12341234";
+WiFiManager wifiManager;
+Preferences preferences;
 
 //==============================================================================
-// MQTT 설정
+// MQTT 설정 (WiFiManager에서 설정 가능하도록 변수로 변경)
 //==============================================================================
 
-const char* MQTT_SERVER = "broker.hivemq.com";
-const int   MQTT_PORT = 1883;
-const char* MQTT_CLIENT_ID = "ESP32_GA1_Agent";
-const char* MQTT_TOPIC_DATA = "ga1agent/data";
-const char* MQTT_TOPIC_STATUS = "ga1agent/status";
-const char* MQTT_TOPIC_CMD = "ga1agent/command";
+char mqtt_server[64] = "192.168.0.190";  //"broker.hivemq.com";
+char mqtt_port[6] = "1883";
+char mqtt_client_id[32] = "ESP32_GA1_Agent";
+char mqtt_user[32] = "";
+char mqtt_pass[32] = "";
 
-const char* MQTT_USER = "";
-const char* MQTT_PASS = "";
+// MQTT 토픽
+const char* MQTT_TOPIC_DATA = "factory/scm_a3/data";
+const char* MQTT_TOPIC_STATUS = "factory/scm_a3/status";
+const char* MQTT_TOPIC_CMD = "factory/scm_a3/command";
+
+// 커스텀 파라미터 (MQTT 설정)
+WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 64);
+WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port, 6);
+WiFiManagerParameter custom_mqtt_client("client", "Client ID", mqtt_client_id, 32);
+WiFiManagerParameter custom_mqtt_user("user", "MQTT User (optional)", mqtt_user, 32);
+WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Pass (optional)", mqtt_pass, 32);
 
 //==============================================================================
 // 전역 변수
@@ -65,24 +86,27 @@ PubSubClient mqttClient(wifiClient);
 
 bool wifiConnected = false;
 bool mqttConnected = false;
-unsigned long lastWifiAttempt = 0;
 unsigned long lastMqttAttempt = 0;
 unsigned long packetCount = 0;
 unsigned long mqttSentCount = 0;
 unsigned long mqttFailCount = 0;
 unsigned long lastStatusTime = 0;
 
+// 리셋 버튼 관련
+unsigned long resetButtonPressTime = 0;
+bool resetButtonPressed = false;
+
 //==============================================================================
 // 패킷 수신 상태 머신
 //==============================================================================
 
 enum RxState {
-    RX_WAIT_STX,      // STX 대기
-    RX_GET_LEN_L,     // 길이 하위 바이트
-    RX_GET_LEN_H,     // 길이 상위 바이트
-    RX_GET_DATA,      // 데이터 수신
-    RX_GET_CHK,       // 체크섬
-    RX_GET_ETX        // ETX
+    RX_WAIT_STX,
+    RX_GET_LEN_L,
+    RX_GET_LEN_H,
+    RX_GET_DATA,
+    RX_GET_CHK,
+    RX_GET_ETX
 };
 
 RxState rxState = RX_WAIT_STX;
@@ -113,10 +137,126 @@ int mqttQueueHead = 0;
 int mqttQueueTail = 0;
 
 //==============================================================================
+// NVS에 MQTT 설정 저장/로드
+//==============================================================================
+
+void saveMqttConfig() 
+{
+    preferences.begin("mqtt", false);
+    preferences.putString("server", mqtt_server);
+    preferences.putString("port", mqtt_port);
+    preferences.putString("client", mqtt_client_id);
+    preferences.putString("user", mqtt_user);
+    preferences.putString("pass", mqtt_pass);
+    preferences.end();
+    
+    DBG_PRINTLN("[NVS] MQTT config saved");
+}
+
+void loadMqttConfig() 
+{
+    preferences.begin("mqtt", true);
+    
+    String server = preferences.getString("server", "broker.hivemq.com");
+    String port = preferences.getString("port", "1883");
+    String client = preferences.getString("client", "ESP32_GA1_Agent");
+    String user = preferences.getString("user", "");
+    String pass = preferences.getString("pass", "");
+    
+    server.toCharArray(mqtt_server, 64);
+    port.toCharArray(mqtt_port, 6);
+    client.toCharArray(mqtt_client_id, 32);
+    user.toCharArray(mqtt_user, 32);
+    pass.toCharArray(mqtt_pass, 32);
+    
+    preferences.end();
+    
+    DBG_PRINTLN("[NVS] MQTT config loaded");
+    DBG_PRINTF("  Server: %s:%s\n", mqtt_server, mqtt_port);
+    DBG_PRINTF("  Client: %s\n", mqtt_client_id);
+}
+
+//==============================================================================
+// WiFiManager 콜백 - 설정 저장 시 호출
+//==============================================================================
+
+void saveConfigCallback() 
+{
+    DBG_PRINTLN("[WiFiManager] Config saved callback");
+    
+    // 커스텀 파라미터 값 복사
+    strcpy(mqtt_server, custom_mqtt_server.getValue());
+    strcpy(mqtt_port, custom_mqtt_port.getValue());
+    strcpy(mqtt_client_id, custom_mqtt_client.getValue());
+    strcpy(mqtt_user, custom_mqtt_user.getValue());
+    strcpy(mqtt_pass, custom_mqtt_pass.getValue());
+    
+    // NVS에 저장
+    saveMqttConfig();
+}
+
+//==============================================================================
+// WiFi 설정 초기화
+//==============================================================================
+
+void resetWiFiSettings() 
+{
+    DBG_PRINTLN("\n[RESET] Clearing WiFi settings...");
+    
+    wifiManager.resetSettings();
+    
+    // MQTT 설정도 초기화
+    preferences.begin("mqtt", false);
+    preferences.clear();
+    preferences.end();
+    
+    DBG_PRINTLN("[RESET] Done! Restarting...");
+    delay(1000);
+    ESP.restart();
+}
+
+//==============================================================================
+// 리셋 버튼 체크 (GPIO0, 5초 누르면 초기화)
+//==============================================================================
+
+void checkResetButton() 
+{
+    if (digitalRead(RESET_PIN) == LOW) 
+    {
+        if (!resetButtonPressed) 
+        {
+            resetButtonPressed = true;
+            resetButtonPressTime = millis();
+            DBG_PRINTLN("[BUTTON] Pressed - hold 5s to reset WiFi");
+        } 
+        else if (millis() - resetButtonPressTime > 5000) 
+        {
+            // LED 빠르게 깜빡임
+            for (int i = 0; i < 10; i++) 
+            {
+                digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+                delay(100);
+            }
+            resetWiFiSettings();
+        }
+    } 
+    else 
+    {
+        if (resetButtonPressed) 
+        {
+            unsigned long pressDuration = millis() - resetButtonPressTime;
+            DBG_PRINTF("[BUTTON] Released after %lu ms\n", pressDuration);
+        }
+        resetButtonPressed = false;
+    }
+}
+
+//==============================================================================
 // Setup
 //==============================================================================
 
-void setup() {
+void setup() 
+{
     Serial.begin(115200);
     delay(100);
     
@@ -126,6 +266,7 @@ void setup() {
     #endif
     
     pinMode(LED_PIN, OUTPUT);
+    pinMode(RESET_PIN, INPUT_PULLUP);
     digitalWrite(LED_PIN, LOW);
     
     for (int i = 0; i < MQTT_QUEUE_SIZE; i++) {
@@ -134,19 +275,82 @@ void setup() {
     
     delay(500);
     DBG_PRINTLN("\n========================================");
-    DBG_PRINTLN("ESP32 UART + MQTT Gateway (v2)");
+    DBG_PRINTLN("ESP32 UART + MQTT Gateway (v3)");
     DBG_PRINTLN("========================================");
-    DBG_PRINTLN("Fixed: Length-based packet reception");
+    DBG_PRINTLN("WiFiManager enabled!");
+    DBG_PRINTLN("Hold GPIO0 for 5s to reset WiFi");
     DBG_PRINTLN("========================================\n");
     
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiAttempt = millis();
+    // NVS에서 MQTT 설정 로드
+    loadMqttConfig();
     
-    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+    //==========================================================================
+    // WiFiManager 설정
+    //==========================================================================
+    
+    // 디버그 출력
+    wifiManager.setDebugOutput(true);
+    
+    // 설정 포털 타임아웃 (초)
+    wifiManager.setConfigPortalTimeout(PORTAL_TIMEOUT);
+    
+    // 연결 타임아웃
+    wifiManager.setConnectTimeout(20);
+    
+    // 저장 콜백 등록
+    wifiManager.setSaveConfigCallback(saveConfigCallback);
+    
+    // 커스텀 파라미터 추가 (MQTT 설정)
+    wifiManager.addParameter(&custom_mqtt_server);
+    wifiManager.addParameter(&custom_mqtt_port);
+    wifiManager.addParameter(&custom_mqtt_client);
+    wifiManager.addParameter(&custom_mqtt_user);
+    wifiManager.addParameter(&custom_mqtt_pass);
+    
+    // AP 모드일 때 표시할 정보
+    wifiManager.setAPCallback([](WiFiManager* wm) {
+        DBG_PRINTLN("\n[WiFiManager] Entered config portal");
+        DBG_PRINTF("  AP Name: %s\n", AP_NAME);
+        DBG_PRINTF("  AP Pass: %s\n", AP_PASSWORD);
+        DBG_PRINTLN("  Connect and go to 192.168.4.1");
+        
+        // LED 깜빡임으로 설정 모드 표시
+        digitalWrite(LED_PIN, HIGH);
+    });
+    
+    //==========================================================================
+    // WiFi 자동 연결 시도
+    //==========================================================================
+    
+    DBG_PRINTLN("[WiFiManager] Attempting auto-connect...");
+    
+    // autoConnect: 저장된 WiFi에 연결 시도, 실패하면 AP 모드로 전환
+    if (!wifiManager.autoConnect(AP_NAME, AP_PASSWORD)) 
+    {
+        DBG_PRINTLN("[WiFiManager] Failed to connect and portal timeout");
+        DBG_PRINTLN("Restarting...");
+        delay(3000);
+        ESP.restart();
+    }
+    
+    // 연결 성공!
+    wifiConnected = true;
+    digitalWrite(LED_PIN, LOW);
+    
+    DBG_PRINTLN("\n[WiFi] Connected!");
+    DBG_PRINT("  IP: ");
+    DBG_PRINTLN(WiFi.localIP());
+    DBG_PRINT("  SSID: ");
+    DBG_PRINTLN(WiFi.SSID());
+    DBG_PRINTF("  RSSI: %d dBm\n", WiFi.RSSI());
+    
+    // MQTT 설정
+    mqttClient.setServer(mqtt_server, atoi(mqtt_port));
     mqttClient.setCallback(mqttCallback);
     mqttClient.setKeepAlive(60);
     mqttClient.setBufferSize(RX_BUF_SIZE);
+    
+    DBG_PRINTF("\n[MQTT] Server: %s:%s\n", mqtt_server, mqtt_port);
 }
 
 //==============================================================================
@@ -155,12 +359,14 @@ void setup() {
 
 void loop() 
 {
+    checkResetButton();     // ★ 리셋 버튼 체크
     processUART();
     manageWiFi();
     manageMQTT();
     processMqttQueue();
     
-    if (millis() - lastStatusTime > 30000) {
+    if (millis() - lastStatusTime > 30000) 
+    {
         lastStatusTime = millis();
         printStatus();
         publishStatus();
@@ -169,7 +375,6 @@ void loop()
 
 //==============================================================================
 // USB 데이터 수신 (상태 머신 기반)
-// ★ 길이 필드를 읽고 해당 길이만큼 수신
 //==============================================================================
 
 void processUART() 
@@ -180,7 +385,6 @@ void processUART()
         
         switch (rxState) 
         {
-            //------------------------------------------------------------------
             case RX_WAIT_STX:
                 if (b == PROTO_STX) 
                 {
@@ -194,22 +398,19 @@ void processUART()
                 }
                 break;
             
-            //------------------------------------------------------------------
             case RX_GET_LEN_L:
                 rxBuffer[rxIndex++] = b;
-                rxDataLen = b;  // 하위 바이트
+                rxDataLen = b;
                 rxState = RX_GET_LEN_H;
                 break;
             
-            //------------------------------------------------------------------
             case RX_GET_LEN_H:
                 rxBuffer[rxIndex++] = b;
-                rxDataLen |= (b << 8);  // 상위 바이트
+                rxDataLen |= (b << 8);
                 rxDataCount = 0;
                 
                 DBG_PRINTF("[RX] Data length: %d bytes\n", rxDataLen);
                 
-                // 길이 유효성 검사
                 if (rxDataLen > RX_BUF_SIZE - 12) 
                 {
                     DBG_PRINTLN("[RX] ERROR: Length too large! Resetting.");
@@ -217,24 +418,19 @@ void processUART()
                 } 
                 else if (rxDataLen == 0) rxState = RX_GET_CHK;
                 else rxState = RX_GET_DATA;
-
                 break;
             
-            //------------------------------------------------------------------
             case RX_GET_DATA:
                 rxBuffer[rxIndex++] = b;
                 rxDataCount++;
-                
                 if (rxDataCount >= rxDataLen) rxState = RX_GET_CHK;
                 break;
             
-            //------------------------------------------------------------------
             case RX_GET_CHK:
                 rxBuffer[rxIndex++] = b;
                 rxState = RX_GET_ETX;
                 break;
             
-            //------------------------------------------------------------------
             case RX_GET_ETX:
                 rxBuffer[rxIndex++] = b;
                 
@@ -247,13 +443,9 @@ void processUART()
                     DBG_PRINTLN();
                     DBG_PRINTF("[RX] Total: %d bytes, Duration: %lu ms\n", rxIndex, endTime - rxStartTime);
                     
-                    // 패킷 처리
                     processPacket(rxBuffer, rxIndex);
-                    
-                    // ACK 응답
                     sendAckResponse();
                     
-                    // LED 토글
                     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
                     packetCount++;
                     
@@ -265,14 +457,12 @@ void processUART()
                 break;
         }
         
-        // 타임아웃 체크 (수신 중 1초 초과시 리셋)
         if (rxState != RX_WAIT_STX && millis() - rxStartTime > 1000) 
         {
             DBG_PRINTLN("[RX] TIMEOUT! Resetting state machine.");
             rxState = RX_WAIT_STX;
         }
         
-        // 버퍼 오버플로우 방지
         if (rxIndex >= RX_BUF_SIZE - 2) 
         {
             DBG_PRINTLN("[RX] BUFFER OVERFLOW! Resetting.");
@@ -289,14 +479,12 @@ void processPacket(uint8_t* data, int len)
 {
     DBG_PRINTLN("[ANALYZE] Packet structure:");
     
-    // 최소 길이 확인
     if (len < 5) 
     {
         DBG_PRINTLN("[ANALYZE] Too short!");
         return;
     }
     
-    // 체크섬 계산 (LEN_L ~ DATA 끝까지 XOR)
     int chkPos = len - 2;
     uint8_t calcChk = 0;
     
@@ -318,20 +506,17 @@ void processPacket(uint8_t* data, int len)
         return;
     }
     
-    // 아이템 파싱
     if (rxDataLen < 1) 
     {
         DBG_PRINTLN("[ANALYZE] No data!");
         return;
     }
     
-    int itemCount = data[3];  // 아이템 개수
+    int itemCount = data[3];
     DBG_PRINTF("  Item Count: %d\n", itemCount);
     
-    // MQTT 큐에 추가
     MqttQueueItem* item = &mqttQueue[mqttQueueHead];
     
-    // 큐 가득 찬 경우
     int nextHead = (mqttQueueHead + 1) % MQTT_QUEUE_SIZE;
     if (nextHead == mqttQueueTail && mqttQueue[mqttQueueTail].valid) 
     {
@@ -342,11 +527,10 @@ void processPacket(uint8_t* data, int len)
     item->itemCount = min(itemCount, 10);
     item->timestamp = millis();
     
-    // 아이템 데이터 추출
     if (item->itemCount > 0) 
     {
         DBG_PRINTLN("[ANALYZE] Items:");
-        int pos = 4;  // 아이템 시작 위치
+        int pos = 4;
         for (int i = 0; i < item->itemCount && pos + 6 < chkPos; i++) 
         {
             item->itemIds[i] = data[pos] | (data[pos+1] << 8);
@@ -370,7 +554,7 @@ void processPacket(uint8_t* data, int len)
 }
 
 //==============================================================================
-// ACK 응답 (즉시!)
+// ACK 응답
 //==============================================================================
 
 void sendAckResponse()
@@ -378,9 +562,9 @@ void sendAckResponse()
     uint8_t response[5] = 
     {
         PROTO_STX,
-        0x01,  // CMD_ACK
-        0x00,  // STATUS_OK
-        0x01,  // Checksum
+        0x01,
+        0x00,
+        0x01,
         PROTO_ETX
     };
     
@@ -395,7 +579,7 @@ void sendAckResponse()
 }
 
 //==============================================================================
-// WiFi 관리
+// WiFi 관리 (WiFiManager 사용으로 간소화)
 //==============================================================================
 
 void manageWiFi()
@@ -405,7 +589,7 @@ void manageWiFi()
         if (!wifiConnected) 
         {
             wifiConnected = true;
-            DBG_PRINT("[WiFi] Connected! IP: ");
+            DBG_PRINT("[WiFi] Reconnected! IP: ");
             DBG_PRINTLN(WiFi.localIP());
         }
     } 
@@ -418,11 +602,15 @@ void manageWiFi()
             DBG_PRINTLN("[WiFi] Disconnected!");
         }
         
-        if (millis() - lastWifiAttempt > 10000) 
+        // WiFiManager가 자동으로 재연결 시도
+        // 일정 시간 후에도 연결 안되면 재부팅 고려
+        static unsigned long disconnectTime = 0;
+        if (disconnectTime == 0) disconnectTime = millis();
+        
+        if (millis() - disconnectTime > 60000)  // 1분 동안 연결 안되면
         {
-            lastWifiAttempt = millis();
-            DBG_PRINTLN("[WiFi] Reconnecting...");
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            DBG_PRINTLN("[WiFi] Connection lost for 60s, restarting...");
+            ESP.restart();
         }
     }
 }
@@ -466,11 +654,13 @@ void manageMQTT()
 
 void connectMQTT()
 {
-    DBG_PRINTF("[MQTT] Connecting to %s...\n", MQTT_SERVER);
+    DBG_PRINTF("[MQTT] Connecting to %s:%s...\n", mqtt_server, mqtt_port);
     
     bool connected;
-    if (strlen(MQTT_USER) > 0) connected = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
-    else connected = mqttClient.connect(MQTT_CLIENT_ID);
+    if (strlen(mqtt_user) > 0) 
+        connected = mqttClient.connect(mqtt_client_id, mqtt_user, mqtt_pass);
+    else 
+        connected = mqttClient.connect(mqtt_client_id);
     
     if (connected) 
     {
@@ -479,7 +669,8 @@ void connectMQTT()
         mqttClient.subscribe(MQTT_TOPIC_CMD);
         publishStatus();
     } 
-    else DBG_PRINTF("[MQTT] Failed! rc=%d\n", mqttClient.state());
+    else 
+        DBG_PRINTF("[MQTT] Failed! rc=%d\n", mqttClient.state());
 }
 
 //==============================================================================
@@ -507,6 +698,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
             else if (strcmp(cmd, "reset") == 0) packetCount = mqttSentCount = mqttFailCount = 0;
             else if (strcmp(cmd, "led_on") == 0) digitalWrite(LED_PIN, HIGH);
             else if (strcmp(cmd, "led_off") == 0) digitalWrite(LED_PIN, LOW);
+            else if (strcmp(cmd, "wifi_reset") == 0) resetWiFiSettings();  // ★ 원격 WiFi 초기화
+            else if (strcmp(cmd, "reboot") == 0) ESP.restart();            // ★ 원격 재부팅
         }
     }
 }
@@ -525,8 +718,6 @@ int getMqttQueueSize()
     return size;
 }
 
-#if 1
-//
 void processMqttQueue()
 {
     if (!mqttConnected) return;
@@ -535,11 +726,10 @@ void processMqttQueue()
     MqttQueueItem* item = &mqttQueue[mqttQueueTail];
     
     StaticJsonDocument<512> doc;
-    doc["device"] = MQTT_CLIENT_ID;
+    doc["device"] = mqtt_client_id;
     doc["timestamp"] = item->timestamp;
     doc["packet_id"] = packetCount;
     
-    // ★ 배열 대신 개별 필드로 변경
     for (int i = 0; i < item->itemCount; i++) 
     {
         String valueKey = "value_" + String(item->itemIds[i]);
@@ -569,50 +759,6 @@ void processMqttQueue()
     mqttQueueTail = (mqttQueueTail + 1) % MQTT_QUEUE_SIZE;
 }
 
-#else
-//
-void processMqttQueue()
-{
-    if (!mqttConnected) return;
-    if (!mqttQueue[mqttQueueTail].valid) return;
-    
-    MqttQueueItem* item = &mqttQueue[mqttQueueTail];
-    
-    StaticJsonDocument<512> doc;
-    doc["device"] = MQTT_CLIENT_ID;
-    doc["timestamp"] = item->timestamp;
-    doc["packet_id"] = packetCount;
-    
-    JsonArray items = doc.createNestedArray("items");
-    for (int i = 0; i < item->itemCount; i++) 
-    {
-        JsonObject obj = items.createNestedObject();
-        obj["id"] = item->itemIds[i];
-        obj["quality"] = item->itemQualities[i];
-        obj["value"] = item->itemValues[i];
-    }
-    
-    char jsonBuffer[512];
-    serializeJson(doc, jsonBuffer);
-    
-    DBG_PRINTF("[MQTT] Publish: %s\n", jsonBuffer);
-    
-    if (mqttClient.publish(MQTT_TOPIC_DATA, jsonBuffer)) 
-    {
-        DBG_PRINTLN("[MQTT] OK!");
-        mqttSentCount++;
-    } 
-    else 
-    {
-        DBG_PRINTLN("[MQTT] FAILED!");
-        mqttFailCount++;
-    }
-    
-    item->valid = false;
-    mqttQueueTail = (mqttQueueTail + 1) % MQTT_QUEUE_SIZE;
-}
-#endif
-
 //==============================================================================
 // 상태 출력
 //==============================================================================
@@ -622,20 +768,25 @@ void printStatus()
     DBG_PRINTF("Uptime: %lu sec\n", millis() / 1000);
     DBG_PRINTF("Packets: %lu\n", packetCount);
     DBG_PRINTF("WiFi: %s", wifiConnected ? "OK" : "NO");
-    if (wifiConnected) DBG_PRINTF(" (%s, %ddBm)", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    if (wifiConnected) 
+    {
+        DBG_PRINTF(" (SSID: %s, IP: %s, %ddBm)", 
+                  WiFi.SSID().c_str(),
+                  WiFi.localIP().toString().c_str(), 
+                  WiFi.RSSI());
+    }
     DBG_PRINTLN();
-    DBG_PRINTF("MQTT: %s (sent:%lu, fail:%lu, queue:%d)\n", 
-              mqttConnected ? "OK" : "NO", mqttSentCount, mqttFailCount, getMqttQueueSize());
+    DBG_PRINTF("MQTT: %s (%s:%s)\n", mqttConnected ? "OK" : "NO", mqtt_server, mqtt_port);
+    DBG_PRINTF("  sent:%lu, fail:%lu, queue:%d\n", mqttSentCount, mqttFailCount, getMqttQueueSize());
     DBG_PRINTLN("========================\n");
 }
 
-//
 void publishStatus()
 {
     if (!mqttConnected) return;
     
     StaticJsonDocument<256> doc;
-    doc["device"] = MQTT_CLIENT_ID;
+    doc["device"] = mqtt_client_id;
     doc["uptime"] = millis() / 1000;
     doc["packets"] = packetCount;
     doc["mqtt_sent"] = mqttSentCount;
@@ -643,6 +794,7 @@ void publishStatus()
     doc["rssi"] = WiFi.RSSI();
     doc["heap"] = ESP.getFreeHeap();
     doc["ip"] = WiFi.localIP().toString();
+    doc["ssid"] = WiFi.SSID();
     
     char buf[256];
     serializeJson(doc, buf);
@@ -651,20 +803,32 @@ void publishStatus()
 
 /*
 ================================================================================
-v2 변경사항:
+v3 변경사항 (WiFiManager 적용):
 ================================================================================
 
-1. 상태 머신 기반 패킷 수신:
-   RX_WAIT_STX → RX_GET_LEN_L → RX_GET_LEN_H → RX_GET_DATA → RX_GET_CHK → RX_GET_ETX
-   
-2. 길이 필드를 먼저 읽고, 해당 길이만큼 수신:
-   - 데이터 중간에 0x03이 있어도 ETX로 오인하지 않음 ✓
-   
-3. 타임아웃 처리:
-   - 수신 중 1초 초과시 상태 리셋
-   
-4. 버퍼 오버플로우 방지:
-   - 510바이트 초과시 리셋
+1. WiFiManager 라이브러리 추가
+   - 처음 부팅 시 저장된 WiFi에 자동 연결 시도
+   - 연결 실패 시 "ESP32-GA1-Setup" AP 모드로 전환
+   - 브라우저에서 192.168.4.1 접속하여 WiFi 설정
+
+2. MQTT 설정도 웹에서 설정 가능
+   - Server, Port, Client ID, User, Password
+
+3. 설정 초기화 기능
+   - GPIO0 (BOOT) 버튼 5초 누르면 WiFi 설정 삭제 후 재부팅
+   - MQTT 명령으로도 가능: {"cmd": "wifi_reset"}
+
+4. NVS 저장
+   - WiFi 및 MQTT 설정이 비휘발성 메모리에 저장됨
+
+================================================================================
+라이브러리 설치 (Arduino IDE):
+================================================================================
+
+1. 스케치 → 라이브러리 포함 → 라이브러리 관리
+2. "WiFiManager" 검색 → "WiFiManager by tzapu" 설치
+3. "PubSubClient" 검색 → 설치
+4. "ArduinoJson" 검색 → 설치
 
 ================================================================================
 */
