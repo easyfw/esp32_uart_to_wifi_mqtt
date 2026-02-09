@@ -72,6 +72,8 @@
 
 // MQTT 큐 설정
 #define MQTT_QUEUE_SIZE 100
+
+#undef MQTT_SOCKET_TIMEOUT
 #define MQTT_SOCKET_TIMEOUT 2       // MQTT 소켓 타임아웃 (초) - 기본 15초에서 단축
 
 // MQTT Server 
