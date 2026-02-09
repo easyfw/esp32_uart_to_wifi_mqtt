@@ -83,8 +83,8 @@
 //==============================================================================
 
 char mqtt_server[64] = SERVER_ADDRESS;  
-char mqtt_port[6] = "1883";
-char mqtt_client_id[32] = "ESP32_GA1_Agent";
+char mqtt_port[6] = "5000";  //1883";
+char mqtt_client_id[32] = "ESP32_GA3_Agent";
 char mqtt_user[32] = "";
 char mqtt_pass[32] = "";
 
@@ -222,8 +222,8 @@ void loadMqttConfig()
     preferences.begin("mqtt", true);
     
     String server = preferences.getString("server", SERVER_ADDRESS);
-    String port = preferences.getString("port", "1883");
-    String client = preferences.getString("client", "ESP32_GA1_Agent");
+    String port = preferences.getString("port", "5000");  //1883");
+    String client = preferences.getString("client", "ESP32_GA3_Agent");
     String user = preferences.getString("user", "");
     String pass = preferences.getString("pass", "");
     
