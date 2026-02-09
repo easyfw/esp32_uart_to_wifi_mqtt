@@ -75,7 +75,7 @@
 #define MQTT_SOCKET_TIMEOUT 2       // MQTT 소켓 타임아웃 (초) - 기본 15초에서 단축
 
 // MQTT Server 
-#define SERVER_ADDRESS   "broker.hivemq.com"  //VWware: "192.168.0.190"
+#define SERVER_ADDRESS   "112.218.90.189"     //VWware: "192.168.0.190"
                                               // HK-IoT_Server: "112.218.90.189"
 
 //==============================================================================
